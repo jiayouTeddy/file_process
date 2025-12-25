@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import os
 import csv
+import math
+import numbers
 from typing import List, Optional
 
 import pandas as pd
@@ -41,6 +43,47 @@ app.add_middleware(  # 添加 CORS 中间件
 def _raise(status: int, code: str, detail: str) -> None:
     # 统一抛 HTTPException 的小工具函数（便于保持返回风格一致）
     raise HTTPException(status_code=status, detail={"code": code, "detail": detail})
+
+
+def _export_value_to_text(v: object) -> str:
+    """
+    将单个值转换为“用于导出的文本”。
+
+    目标（对应你的反馈）：
+    - Excel 导出不应该出现 39882.0 这种“整数浮点”显示
+    - 因此：如果值是“浮点但整数值”（例如 39882.0），导出为 "39882"
+    - 其它类型：尽量保持可读的字符串形式
+
+    说明：
+    - 这里同时兼容 numpy 标量（pandas 常见），用 numbers.Real/Integral 做判断
+    - None/NA -> 空字符串
+    """
+
+    # 1) 统一处理 NA/None
+    if v is None or pd.isna(v):  # None 或 pandas 认为的 NA
+        return ""  # 导出为空字符串
+
+    # 2) 字符串直接返回（避免破坏前导零等）
+    if isinstance(v, str):  # 原本就是字符串
+        return v  # 直接返回
+
+    # 3) bool 单独处理（bool 是 Integral 的子类，避免被当成 0/1）
+    if isinstance(v, bool):  # 布尔值
+        return "True" if v else "False"  # 转字符串
+
+    # 4) 整数（含 numpy 整数）直接转 int 再转字符串
+    if isinstance(v, numbers.Integral):  # 整数类型
+        return str(int(v))  # 转为整数字符串
+
+    # 5) 实数（含 numpy 浮点等）：若是整数值的浮点，去掉 .0
+    if isinstance(v, numbers.Real):  # 实数类型（非整数）
+        fv = float(v)  # 转为 Python float
+        if math.isfinite(fv) and fv.is_integer():  # 有限且是整数值
+            return str(int(fv))  # 去掉 .0
+        return str(fv)  # 保留小数
+
+    # 6) 其它类型兜底：转字符串
+    return str(v)
 
 
 @app.post("/api/upload", response_model=UploadResponse)
@@ -230,7 +273,7 @@ async def api_export(session_id: str, result_id: str, format: str = "csv") -> St
     # 说明：
     # - CSV：无法强制 Excel 一定不做自动类型识别，但我们会把内容按字符串写出并全量加引号
     # - XLSX：使用 xlsxwriter 把整列格式设置为“文本(@)”，Excel 打开也会按文本显示
-    values_as_text = ["" if v is None else str(v) for v in res.values]  # 统一转字符串，None -> 空字符串
+    values_as_text = [_export_value_to_text(v) for v in res.values]  # 统一格式化为文本（解决 .0 问题）
     df = pd.DataFrame({"value": values_as_text})  # 单列 DataFrame（全为字符串）
 
     fmt = (format or "csv").lower()  # 统一小写

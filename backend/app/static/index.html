@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>文件列值集合交集/差集工具</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="container">
+      <header class="header">
+        <h1>文件列值集合交集/差集工具</h1>
+        <p class="sub">
+          支持上传多个 Excel/CSV，选择列名后做值集合交集/差集/对称差集；支持列名手动规范化；输出 NA 位置与可下载结果。
+        </p>
+      </header>
+
+      <section class="card">
+        <h2>1) 上传文件（仅 Excel/CSV）</h2>
+        <div class="row">
+          <input id="fileInput" type="file" multiple accept=".csv,.xlsx,.xls" />
+          <button id="btnUpload">上传</button>
+        </div>
+        <div id="uploadStatus" class="status"></div>
+      </section>
+
+      <section class="card">
+        <h2>2) 选择 sheet 并解析（Excel 必选 sheet）</h2>
+        <div id="filesArea" class="stack"></div>
+      </section>
+
+      <section class="card">
+        <h2>3) 预览与 NA 报告</h2>
+        <div class="twoCol">
+          <div>
+            <h3>预览（前 N 行）</h3>
+            <div id="previewArea" class="tableWrap"></div>
+          </div>
+          <div>
+            <h3>NA/空值位置（最多显示前 K 个）</h3>
+            <div id="naArea" class="monoBox"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>4) 列名规范化（手动确认/修改后应用）</h2>
+        <p class="hint">
+          这里不会自动改名：后端只提供建议规范名，你可以手动修改；确认后点击“应用规范化列名”。若新列名重复会报错。
+        </p>
+        <div class="row">
+          <label>选择要规范化的文件：</label>
+          <select id="normalizeFileSelect"></select>
+          <button id="btnLoadNormalize">加载列名建议</button>
+          <button id="btnApplyNormalize">应用规范化列名</button>
+        </div>
+        <div id="normalizeStatus" class="status"></div>
+        <div id="normalizeTableArea" class="tableWrap"></div>
+      </section>
+
+      <section class="card">
+        <h2>5) 集合运算（值集合）</h2>
+        <div class="stack">
+          <div class="row">
+            <label>选择参与运算的文件（至少 2 个）：</label>
+            <div id="setopsFilesCheckboxes" class="wrap"></div>
+          </div>
+          <div class="row">
+            <label>选择共同列名：</label>
+            <select id="setopsColumnSelect"></select>
+            <button id="btnRefreshCommonCols">刷新共同列名</button>
+          </div>
+          <div class="row">
+            <label>运算类型：</label>
+            <select id="setopsOpSelect">
+              <option value="intersection">交集（intersection）</option>
+              <option value="difference">差集（difference，base - others）</option>
+              <option value="symmetric_difference">对称差集（symmetric_difference）</option>
+            </select>
+            <label>difference 的 base 文件：</label>
+            <select id="setopsBaseSelect"></select>
+            <label class="inline">
+              <input id="setopsDropNa" type="checkbox" checked />
+              drop_na（NA 不参与集合）
+            </label>
+            <button id="btnRunSetOps">运行集合运算</button>
+          </div>
+          <div id="setopsStatus" class="status"></div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>6) 结果预览与下载</h2>
+        <div id="resultSummary" class="status"></div>
+        <div class="twoCol">
+          <div>
+            <h3>结果预览（前 100 个）</h3>
+            <div id="resultPreview" class="monoBox"></div>
+          </div>
+          <div>
+            <h3>下载</h3>
+            <div class="row">
+              <button id="btnDownloadCsv">下载 CSV</button>
+              <button id="btnDownloadXlsx">下载 XLSX</button>
+            </div>
+            <p class="hint">下载会从后端按 result_id 导出。</p>
+          </div>
+        </div>
+      </section>
+
+      <footer class="footer">
+        <p>后端：FastAPI；前端：原生 HTML/CSS/JS。</p>
+      </footer>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
+
+

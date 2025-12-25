@@ -1,0 +1,245 @@
+from __future__ import annotations
+
+import io
+import os
+from typing import List, Optional
+
+import pandas as pd
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
+
+from backend.app.models import (
+    NormalizeRequest,
+    NormalizeResponse,
+    ParseRequest,
+    ParseResponse,
+    SetOpsRequest,
+    SetOpsResponse,
+    UploadResponse,
+)
+from backend.app.services.df_analysis import apply_rename_map, find_na_cells, preview_rows, suggest_column_names
+from backend.app.services.file_loader import detect_file_type, get_excel_sheet_names, read_file_to_df
+from backend.app.services.set_ops import compute_set_op
+from backend.app.services.store import store
+
+
+app = FastAPI(title="File Column SetOps Web")  # 创建 FastAPI 应用
+
+# 允许本地开发时前端直接访问（本项目静态文件同源也能用；这里作为兜底）
+app.add_middleware(  # 添加 CORS 中间件
+    CORSMiddleware,
+    allow_origins=["*"],  # 允许所有来源（演示项目；生产请收紧）
+    allow_credentials=True,
+    allow_methods=["*"],  # 允许所有方法
+    allow_headers=["*"],  # 允许所有头
+)
+
+
+def _raise(status: int, code: str, detail: str) -> None:
+    # 统一抛 HTTPException 的小工具函数（便于保持返回风格一致）
+    raise HTTPException(status_code=status, detail={"code": code, "detail": detail})
+
+
+@app.post("/api/upload", response_model=UploadResponse)
+async def api_upload(files: List[UploadFile] = File(...)) -> UploadResponse:
+    # 上传接口：接收多文件并缓存；若 Excel 额外返回 sheet_names
+    store.cleanup()  # 每次请求顺便做一次过期清理（简单实现）
+    session_id = store.create_session()  # 创建新会话
+
+    out_files = []  # 输出文件信息列表
+    for f in files:  # 遍历上传文件
+        if not f.filename:  # 若文件名为空
+            _raise(400, "bad_filename", "文件名为空")  # 抛错
+        try:
+            file_type = detect_file_type(f.filename)  # 判断文件类型
+        except ValueError:
+            _raise(400, "unsupported_file_type", "仅支持上传 excel/csv 文件")  # 类型不支持
+
+        content = await f.read()  # 读取文件 bytes
+        try:
+            file_id = store.add_file(session_id, f.filename, file_type, content)  # 存入缓存
+        except ValueError as e:
+            _raise(400, str(e), f"上传失败：{e}")  # 返回限制错误
+
+        sheet_names: Optional[List[str]] = None  # 默认没有 sheet_names
+        if file_type == "excel":  # Excel 才需要取 sheet
+            try:
+                sheet_names = get_excel_sheet_names(content)  # 解析 sheet 列表
+            except Exception as e:
+                _raise(400, "excel_parse_failed", f"无法读取 Excel 的 sheet 信息：{e}")  # 解析失败
+            store.set_excel_sheet_names(session_id, file_id, sheet_names)  # 写入缓存
+
+        out_files.append(  # 汇总返回信息
+            {
+                "file_id": file_id,
+                "filename": f.filename,
+                "file_type": file_type,
+                "sheet_names": sheet_names,
+            }
+        )
+
+    return UploadResponse(session_id=session_id, files=out_files)  # 返回响应
+
+
+@app.post("/api/parse", response_model=ParseResponse)
+async def api_parse(req: ParseRequest) -> ParseResponse:
+    # 解析接口：按 file_id + (sheet_name) 读取为 DataFrame，并返回分析信息
+    store.cleanup()  # 清理过期会话
+    try:
+        sf = store.get_file(req.session_id, req.file_id)  # 获取文件缓存
+    except KeyError:
+        _raise(404, "file_not_found", "找不到该文件，请重新上传")  # 文件不存在
+
+    # 若为 Excel，必须由前端选择 sheet（这里也做后端校验）
+    if sf.file_type == "excel":  # Excel
+        if not req.sheet_name:  # 没传 sheet
+            _raise(400, "sheet_required", "Excel 文件必须选择一个 sheet")  # 抛错
+        if sf.sheet_names and req.sheet_name not in sf.sheet_names:  # sheet 不存在
+            _raise(400, "sheet_not_found", "选择的 sheet 不存在")  # 抛错
+
+    try:
+        df, selected_sheet = read_file_to_df(sf.content, sf.file_type, req.sheet_name)  # 读入 DataFrame
+    except Exception as e:
+        _raise(400, "read_failed", f"读取文件失败：{e}")  # 读取失败
+
+    # 为了让行号逻辑稳定，这里统一把 index 重置
+    df = df.reset_index(drop=True)  # 重置索引
+
+    # 缓存 df
+    store.put_df(req.session_id, req.file_id, df, selected_sheet)  # 存入缓存
+
+    # 生成列名与建议
+    cols = [str(c) for c in list(df.columns)]  # 原始列名
+    suggestions = suggest_column_names(cols)  # 建议规范名
+
+    # NA 扫描
+    na_cells = find_na_cells(df, max_cells=store.max_na_cells)  # 扫描 NA
+
+    # 预览
+    preview = preview_rows(df, n=store.max_preview_rows)  # 生成预览
+
+    return ParseResponse(  # 返回解析结果
+        columns_original=cols,
+        columns_suggestions=suggestions,
+        na_cells=na_cells,  # pydantic 会自动把 dict 转为 NaCell
+        preview_rows=preview,
+    )
+
+
+@app.post("/api/normalize", response_model=NormalizeResponse)
+async def api_normalize(req: NormalizeRequest) -> NormalizeResponse:
+    # 列名规范化接口：应用前端提交的 rename_map 并返回最终列名
+    store.cleanup()  # 清理过期会话
+    try:
+        df = store.get_df(req.session_id, req.file_id)  # 获取 DataFrame
+    except KeyError:
+        _raise(404, "df_not_found", "尚未解析该文件，请先解析")  # 还没 parse
+
+    try:
+        df2 = apply_rename_map(df, req.rename_map)  # 应用列名映射
+    except ValueError as e:
+        _raise(400, "rename_failed", str(e))  # 重命名失败
+
+    # 覆盖缓存
+    try:
+        sf = store.get_file(req.session_id, req.file_id)  # 获取文件信息
+        store.put_df(req.session_id, req.file_id, df2, sf.selected_sheet)  # 更新缓存
+    except KeyError:
+        store.put_df(req.session_id, req.file_id, df2, None)  # 兜底写入
+
+    cols2 = [str(c) for c in list(df2.columns)]  # 获取规范化后的列名
+    return NormalizeResponse(columns_normalized=cols2)  # 返回结果
+
+
+@app.post("/api/setops", response_model=SetOpsResponse)
+async def api_setops(req: SetOpsRequest) -> SetOpsResponse:
+    # 集合运算接口：对多个文件同名列的“唯一值集合”做交集/差集/对称差集
+    store.cleanup()  # 清理过期会话
+
+    # 获取所有 df
+    dfs = []  # DataFrame 列表
+    for fid in req.file_ids:  # 遍历 file_ids
+        try:
+            df = store.get_df(req.session_id, fid)  # 获取 df
+        except KeyError:
+            _raise(404, "df_not_found", "存在未解析的文件，请先解析并规范化")  # 缺 df
+        dfs.append(df)  # 记录
+
+    # 差集需要 base_file_id
+    base_index: Optional[int] = None  # base 索引
+    if req.op == "difference":  # 差集
+        if not req.base_file_id:  # 未提供 base
+            _raise(400, "base_required", "difference 运算必须指定 base_file_id")  # 抛错
+        if req.base_file_id not in req.file_ids:  # base 不在选中列表
+            _raise(400, "base_invalid", "base_file_id 必须在 file_ids 中")  # 抛错
+        base_index = req.file_ids.index(req.base_file_id)  # 找到 base 的位置
+
+    # 计算集合运算
+    try:
+        values = compute_set_op(  # 执行运算
+            dfs=dfs,
+            column_name=req.column_name,
+            op=req.op,
+            drop_na=req.drop_na,
+            base_index=base_index,
+        )
+    except KeyError as e:
+        _raise(400, "column_not_found", str(e))  # 列不存在
+    except ValueError as e:
+        _raise(400, "setops_failed", str(e))  # 运算失败
+
+    # 缓存结果
+    try:
+        result_id = store.put_result(req.session_id, values)  # 写入结果缓存
+    except ValueError as e:
+        _raise(400, "result_too_large", str(e))  # 结果太大
+
+    # 生成预览（最多前 100 个）
+    preview = values[:100]  # 截断预览
+    return SetOpsResponse(result_id=result_id, count=len(values), values_preview=preview)  # 返回响应
+
+
+@app.get("/api/export")
+async def api_export(session_id: str, result_id: str, format: str = "csv") -> StreamingResponse:
+    # 导出接口：下载结果为 csv 或 xlsx
+    store.cleanup()  # 清理过期
+    try:
+        res = store.get_result(session_id, result_id)  # 获取结果
+    except KeyError:
+        _raise(404, "result_not_found", "找不到结果，请重新计算")  # 结果不存在
+
+    # 组装为单列表格，便于导出
+    df = pd.DataFrame({"value": res.values})  # 单列 DataFrame
+
+    fmt = (format or "csv").lower()  # 统一小写
+    if fmt == "csv":  # 导出 CSV
+        buf = io.StringIO()  # 文本缓冲
+        df.to_csv(buf, index=False)  # 写入 CSV
+        data = buf.getvalue().encode("utf-8-sig")  # 使用 utf-8-sig 兼容 Excel 打开
+        return StreamingResponse(  # 返回流式响应
+            io.BytesIO(data),  # bytes 流
+            media_type="text/csv; charset=utf-8",  # MIME
+            headers={"Content-Disposition": 'attachment; filename="result.csv"'},  # 下载文件名
+        )
+
+    if fmt == "xlsx":  # 导出 Excel
+        bio = io.BytesIO()  # 二进制缓冲
+        with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:  # 创建 ExcelWriter
+            df.to_excel(writer, index=False, sheet_name="result")  # 写入 sheet
+        bio.seek(0)  # 重置指针
+        return StreamingResponse(  # 返回流式响应
+            bio,  # bytes 流
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # MIME
+            headers={"Content-Disposition": 'attachment; filename="result.xlsx"'},  # 下载文件名
+        )
+
+    _raise(400, "unsupported_format", "format 仅支持 csv 或 xlsx")  # 不支持的格式
+
+
+# 静态前端托管（Vanilla 前端）
+static_dir = os.path.join(os.path.dirname(__file__), "static")  # 静态目录路径
+app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")  # 挂载为站点根
+
+

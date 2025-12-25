@@ -58,7 +58,7 @@ class Store:
         ttl_seconds: int = 30 * 60,
         max_files_per_session: int = 20,
         max_file_bytes: int = 20 * 1024 * 1024,
-        max_preview_rows: int = 30,
+        max_preview_rows: int = 10,
         max_na_cells: int = 5000,
         max_export_values: int = 2_000_000,
     ) -> None:

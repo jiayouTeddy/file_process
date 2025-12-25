@@ -101,6 +101,8 @@ button:hover {
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 10px;
   background: #0f1730;
+  /* 限制高度：避免第 3 步因为内容过多把第 4 步顶得很远 */
+  max-height: 320px;
 }
 table {
   border-collapse: collapse;
@@ -128,6 +130,8 @@ th {
   background: #0f1730;
   padding: 10px;
   min-height: 120px;
+  /* 限制高度：NA 太多时改为盒内滚动，不再无限拉长页面 */
+  max-height: 320px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   font-size: 12px;
   overflow: auto;

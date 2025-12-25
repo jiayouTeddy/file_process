@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import io
 import os
+import csv
 from typing import List, Optional
 
 import pandas as pd
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -43,10 +44,24 @@ def _raise(status: int, code: str, detail: str) -> None:
 
 
 @app.post("/api/upload", response_model=UploadResponse)
-async def api_upload(files: List[UploadFile] = File(...)) -> UploadResponse:
+async def api_upload(
+    session_id: Optional[str] = Form(None),
+    files: List[UploadFile] = File(...),
+) -> UploadResponse:
     # 上传接口：接收多文件并缓存；若 Excel 额外返回 sheet_names
+    # 说明：
+    # - 第一次上传：session_id 为空，后端创建新会话
+    # - 追加上传：前端带 session_id，后端把文件追加到同一个会话中（解决“分多次上传导致只剩一个文件”的问题）
     store.cleanup()  # 每次请求顺便做一次过期清理（简单实现）
-    session_id = store.create_session()  # 创建新会话
+    if session_id:  # 若前端传了 session_id（追加上传）
+        try:
+            store.get_session(session_id)  # 校验会话存在，并 touch
+        except KeyError:
+            # 会话过期/不存在：降级为创建新会话
+            session_id = store.create_session()
+    else:
+        # 未传 session_id：创建新会话
+        session_id = store.create_session()  # 创建新会话
 
     out_files = []  # 输出文件信息列表
     for f in files:  # 遍历上传文件
@@ -211,12 +226,21 @@ async def api_export(session_id: str, result_id: str, format: str = "csv") -> St
         _raise(404, "result_not_found", "找不到结果，请重新计算")  # 结果不存在
 
     # 组装为单列表格，便于导出
-    df = pd.DataFrame({"value": res.values})  # 单列 DataFrame
+    # 需求：导出文件默认为“字符型/文本”格式
+    # 说明：
+    # - CSV：无法强制 Excel 一定不做自动类型识别，但我们会把内容按字符串写出并全量加引号
+    # - XLSX：使用 xlsxwriter 把整列格式设置为“文本(@)”，Excel 打开也会按文本显示
+    values_as_text = ["" if v is None else str(v) for v in res.values]  # 统一转字符串，None -> 空字符串
+    df = pd.DataFrame({"value": values_as_text})  # 单列 DataFrame（全为字符串）
 
     fmt = (format or "csv").lower()  # 统一小写
     if fmt == "csv":  # 导出 CSV
         buf = io.StringIO()  # 文本缓冲
-        df.to_csv(buf, index=False)  # 写入 CSV
+        df.to_csv(  # 写入 CSV
+            buf,
+            index=False,
+            quoting=csv.QUOTE_ALL,  # 全量加引号，尽量减少 Excel 自动识别为数字的概率
+        )
         data = buf.getvalue().encode("utf-8-sig")  # 使用 utf-8-sig 兼容 Excel 打开
         return StreamingResponse(  # 返回流式响应
             io.BytesIO(data),  # bytes 流
@@ -228,6 +252,11 @@ async def api_export(session_id: str, result_id: str, format: str = "csv") -> St
         bio = io.BytesIO()  # 二进制缓冲
         with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:  # 创建 ExcelWriter
             df.to_excel(writer, index=False, sheet_name="result")  # 写入 sheet
+            # 将第一列（value）设置为“文本格式(@)”
+            workbook = writer.book  # xlsxwriter workbook
+            worksheet = writer.sheets["result"]  # 获取 worksheet
+            text_fmt = workbook.add_format({"num_format": "@"})  # 文本格式
+            worksheet.set_column(0, 0, 40, text_fmt)  # 设置 A 列宽度与格式
         bio.seek(0)  # 重置指针
         return StreamingResponse(  # 返回流式响应
             bio,  # bytes 流

@@ -51,9 +51,15 @@ function setStatus(id, text) {
 // API 调用封装
 // -----------------------------
 
-async function apiUpload(files) {
+async function apiUpload(files, sessionId) {
   // 调用 /api/upload 上传多个文件
+  // 说明：
+  // - sessionId 为空：第一次上传，后端创建新会话
+  // - sessionId 不为空：追加上传到同一会话，避免“分两次上传导致只剩一个文件”
   const form = new FormData(); // 创建 multipart 表单
+  if (sessionId) {
+    form.append("session_id", sessionId); // 作为表单字段传给后端
+  }
   for (const f of files) {
     form.append("files", f); // 后端参数名为 files
   }
@@ -213,8 +219,13 @@ function renderPreviewAndNa(fileId) {
   if (na.length === 0) {
     $("naArea").textContent = "未发现 NA/空值。";
   } else {
-    const lines = na.map((x) => `row=${x.row}, col=${x.col}`);
-    $("naArea").textContent = lines.join("\n");
+    // NA 可能非常多：为了不把页面无限拉长，这里只展示前 N 条，并显示总数
+    const maxShow = 200; // 前端展示上限（后端仍会返回最多 K 条；这里进一步限制 UI 展示）
+    const head = na.slice(0, maxShow);
+    const lines = head.map((x) => `row=${x.row}, col=${x.col}`);
+    const prefix = `NA 总数（后端返回）：${na.length}\n展示前 ${head.length} 条：\n`;
+    const suffix = na.length > head.length ? `\n...\n（已截断展示，避免页面过长）` : "";
+    $("naArea").textContent = prefix + lines.join("\n") + suffix;
   }
 }
 
@@ -440,15 +451,48 @@ async function onUpload() {
   }
 
   try {
-    setStatus("uploadStatus", "上传中...");
-    const data = await apiUpload(files);
-    // 保存会话与文件信息
-    state.sessionId = data.session_id;
-    state.files = data.files || [];
-    state.parsed = {};
-    state.normalizedColumns = {};
-    state.lastResult = { resultId: null, count: 0, preview: [] };
-    setStatus("uploadStatus", `上传成功：session_id=${state.sessionId}\n共 ${state.files.length} 个文件。`);
+    const oldSessionId = state.sessionId; // 保存旧会话（用于判断是否追加上传/会话是否变化）
+    const isAppend = Boolean(oldSessionId); // 是否为追加上传
+
+    setStatus("uploadStatus", isAppend ? "追加上传中..." : "上传中...");
+    const data = await apiUpload(files, oldSessionId);
+
+    const newSessionId = data.session_id; // 后端返回的 session_id
+    const newFiles = data.files || []; // 本次上传新增的文件列表（后端只返回新增部分）
+
+    if (!isAppend || !oldSessionId) {
+      // 第一次上传：初始化会话与状态
+      state.sessionId = newSessionId;
+      state.files = newFiles;
+      state.parsed = {};
+      state.normalizedColumns = {};
+      state.lastResult = { resultId: null, count: 0, preview: [] };
+      setStatus("uploadStatus", `上传成功：session_id=${state.sessionId}\n共 ${state.files.length} 个文件。`);
+    } else if (newSessionId !== oldSessionId) {
+      // 追加上传但会话发生变化：通常是会话过期/不存在，后端降级为创建新会话
+      // 为避免后续操作引用旧 file_id 失败，这里直接清空旧状态并提示用户重新解析
+      state.sessionId = newSessionId;
+      state.files = newFiles;
+      state.parsed = {};
+      state.normalizedColumns = {};
+      state.lastResult = { resultId: null, count: 0, preview: [] };
+      setStatus(
+        "uploadStatus",
+        `原会话已失效，已创建新会话：session_id=${state.sessionId}\n当前仅保留本次上传的 ${state.files.length} 个文件，请重新解析。`
+      );
+    } else {
+      // 正常追加上传：合并文件列表，保持已解析/已规范化状态不变
+      state.sessionId = newSessionId;
+      state.files = [...state.files, ...newFiles];
+      setStatus(
+        "uploadStatus",
+        `追加上传成功：session_id=${state.sessionId}\n新增 ${newFiles.length} 个文件，当前共 ${state.files.length} 个文件。`
+      );
+    }
+
+    // 清空 input，避免某些浏览器选择同一文件时不触发 change
+    input.value = "";
+
     // 渲染文件解析区与相关 UI
     renderFilesArea();
     renderNormalizeFileSelect();

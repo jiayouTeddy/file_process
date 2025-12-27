@@ -126,6 +126,28 @@ async function apiSetOps(payload) {
   return data;
 }
 
+async function apiExportRaw(payload) {
+  // 调用 /api/export_raw 导出原始数据（基于结果 ID 筛选）
+  const resp = await fetch("/api/export_raw", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  
+  // 这个接口返回文件流（ZIP 或 Excel），不是 JSON
+  if (!resp.ok) {
+    // 如果出错，尝试读取 JSON 错误信息
+    try {
+      const errorData = await resp.json();
+      throw new Error(JSON.stringify(errorData));
+    } catch {
+      throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+    }
+  }
+  
+  return resp; // 返回 Response 对象（供下载使用）
+}
+
 // -----------------------------
 // UI 渲染：文件列表（选择 sheet + 解析）
 // -----------------------------
@@ -190,6 +212,7 @@ function renderFilesArea() {
         renderPreviewAndNa(file.file_id);
         renderNormalizeFileSelect();
         renderSetOpsFiles();
+        renderExportRawFilesCheckboxes();
       } catch (e) {
         setStatus(`parseStatus_${file.file_id}`, `解析失败：${e.message}`);
       }
@@ -318,7 +341,7 @@ function collectRenameMapFromTable() {
 // -----------------------------
 
 function renderSetOpsFiles() {
-  // 渲染“参与运算文件”复选框
+  // 渲染"参与运算文件"复选框
   const wrap = $("setopsFilesCheckboxes");
   wrap.innerHTML = "";
 
@@ -342,11 +365,47 @@ function renderSetOpsFiles() {
 
   // 同步 base 下拉
   renderBaseSelect();
+  // 同步导出原始数据的文件选择框
+  renderExportRawFilesCheckboxes();
+}
+
+function renderExportRawFilesCheckboxes() {
+  // 渲染"导出原始数据"的文件复选框
+  const wrap = $("exportRawFilesCheckboxes");
+  wrap.innerHTML = "";
+
+  // 只显示已解析的文件
+  const parsedFileIds = state.files.filter((f) => state.parsed[f.file_id]).map((f) => f.file_id);
+  if (parsedFileIds.length === 0) {
+    wrap.innerHTML = `<span class="hint">请先解析文件。</span>`;
+    return;
+  }
+
+  for (const file of state.files) {
+    if (!state.parsed[file.file_id]) continue;
+    const label = document.createElement("label");
+    label.className = "inline";
+    label.innerHTML = `
+      <input type="checkbox" class="exportRawFileCk" value="${escapeHtml(file.file_id)}" />
+      ${escapeHtml(file.filename)}
+    `;
+    wrap.appendChild(label);
+  }
 }
 
 function getSelectedFileIdsForSetOps() {
   // 获取勾选的 file_ids
   const cks = document.querySelectorAll(".setopsFileCk");
+  const ids = [];
+  for (const ck of cks) {
+    if (ck.checked) ids.push(ck.value);
+  }
+  return ids;
+}
+
+function getSelectedFileIdsForExportRaw() {
+  // 获取导出原始数据勾选的 file_ids
+  const cks = document.querySelectorAll(".exportRawFileCk");
   const ids = [];
   for (const ck of cks) {
     if (ck.checked) ids.push(ck.value);
@@ -499,6 +558,7 @@ async function onUpload() {
     renderSetOpsFiles();
     renderCommonColumnsSelect();
     renderResult();
+    renderExportRawFilesCheckboxes();
   } catch (e) {
     setStatus("uploadStatus", `上传失败：${e.message}`);
   }
@@ -539,7 +599,7 @@ async function onApplyNormalize() {
 }
 
 async function onRunSetOps() {
-  // 点击“运行集合运算”按钮事件
+  // 点击"运行集合运算"按钮事件
   const fileIds = getSelectedFileIdsForSetOps();
   const columnName = $("setopsColumnSelect").value;
   const op = $("setopsOpSelect").value;
@@ -582,6 +642,63 @@ async function onRunSetOps() {
   }
 }
 
+async function onExportRaw() {
+  // 点击"导出原始数据"按钮事件
+  const fileIds = getSelectedFileIdsForExportRaw();
+  const columnName = $("exportRawColumnName").value.trim();
+
+  if (!state.sessionId) {
+    alert("请先上传文件");
+    return;
+  }
+  if (!state.lastResult.resultId) {
+    alert("请先运行集合运算，生成结果 ID 列表");
+    return;
+  }
+  if (fileIds.length === 0) {
+    alert("请至少选择一个要导出的文件");
+    return;
+  }
+  if (!columnName) {
+    alert("请输入筛选列名（例如：patient_id）");
+    return;
+  }
+
+  try {
+    setStatus("exportRawStatus", "导出中，请稍候...");
+    const payload = {
+      session_id: state.sessionId,
+      result_id: state.lastResult.resultId,
+      file_ids: fileIds,
+      column_name: columnName,
+    };
+    const resp = await apiExportRaw(payload);
+
+    // 获取文件名（从 Content-Disposition 头中提取）
+    const disposition = resp.headers.get("Content-Disposition");
+    let filename = "filtered_data.zip"; // 默认文件名
+    if (disposition) {
+      const match = disposition.match(/filename="?(.+?)"?$/);
+      if (match) filename = match[1];
+    }
+
+    // 将响应转为 Blob 并触发下载
+    const blob = await resp.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(url);
+
+    setStatus("exportRawStatus", `导出成功：${filename}`);
+  } catch (e) {
+    setStatus("exportRawStatus", `导出失败：${e.message}`);
+  }
+}
+
 // -----------------------------
 // 页面初始化：绑定事件
 // -----------------------------
@@ -600,6 +717,8 @@ function init() {
   // 绑定下载按钮
   $("btnDownloadCsv").addEventListener("click", () => downloadResult("csv"));
   $("btnDownloadXlsx").addEventListener("click", () => downloadResult("xlsx"));
+  // 绑定导出原始数据按钮
+  $("btnExportRaw").addEventListener("click", onExportRaw);
 
   // 初始渲染提示
   renderFilesArea();

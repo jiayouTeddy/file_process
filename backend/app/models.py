@@ -91,3 +91,14 @@ class SetOpsResponse(BaseModel):
     values_preview: List[object]
 
 
+class ExportRawRequest(BaseModel):
+    # 会话 ID
+    session_id: str
+    # 结果 ID（集合运算的结果，包含 ID 列表）
+    result_id: str
+    # 要导出的文件 ID 列表（选择哪些原始文件）
+    file_ids: List[str] = Field(min_length=1)
+    # 用于筛选的列名（默认为 "patient_id"，可配置）
+    column_name: str = "patient_id"
+
+

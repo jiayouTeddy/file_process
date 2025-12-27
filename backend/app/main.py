@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import io
-import os
 import csv
 import math
 import numbers
+import os
+import zipfile
 from typing import List, Optional
 
 import pandas as pd
@@ -14,6 +15,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.app.models import (
+    ExportRawRequest,
     NormalizeRequest,
     NormalizeResponse,
     ParseRequest,
@@ -308,6 +310,109 @@ async def api_export(session_id: str, result_id: str, format: str = "csv") -> St
         )
 
     _raise(400, "unsupported_format", "format 仅支持 csv 或 xlsx")  # 不支持的格式
+
+
+@app.post("/api/export_raw")
+async def api_export_raw(req: ExportRawRequest) -> StreamingResponse:
+    """
+    基于集合运算结果导出原始数据接口。
+    
+    功能说明：
+    1. 获取集合运算的结果 ID 列表（例如第 6 步计算出的 83 个 patient_id）
+    2. 根据指定的列名（默认为 patient_id），从原始文件中筛选出匹配的行
+    3. 保留原始文件的所有列
+    4. 将每个文件的筛选结果打包为 ZIP 文件返回
+    """
+    store.cleanup()  # 清理过期会话
+    
+    # 获取集合运算结果（ID 列表）
+    try:
+        result = store.get_result(req.session_id, req.result_id)  # 获取结果对象
+    except KeyError:
+        _raise(404, "result_not_found", "找不到结果，请重新计算")  # 结果不存在
+    
+    # 将结果值转换为集合，便于快速查找
+    id_set = set(result.values)  # 结果 ID 集合
+    
+    # 创建 ID 顺序映射：将每个 ID 映射到它在结果列表中的位置（用于后续排序）
+    # 说明：这样可以确保所有导出文件的行顺序与结果 ID 列表的顺序一致
+    id_order_map = {v: idx for idx, v in enumerate(result.values)}  # ID -> 顺序位置
+    
+    # 为每个文件生成筛选后的 DataFrame
+    filtered_files = []  # 存储 (filename, dataframe) 元组
+    
+    for file_id in req.file_ids:  # 遍历要导出的文件
+        try:
+            # 获取原始 DataFrame
+            df = store.get_df(req.session_id, file_id)  # 获取 DataFrame
+            # 获取文件信息（用于获取原始文件名）
+            sf = store.get_file(req.session_id, file_id)  # 获取文件对象
+        except KeyError:
+            _raise(404, "file_not_found", f"文件 {file_id} 不存在，请重新上传")  # 文件不存在
+        
+        # 检查列是否存在
+        if req.column_name not in df.columns:  # 列不存在
+            _raise(400, "column_not_found", f"文件 {sf.filename} 中不存在列 {req.column_name}")  # 抛错
+        
+        # 筛选：保留 column_name 列的值在 id_set 中的所有行
+        # 说明：对于字符串值，需要做 strip 处理（与集合运算逻辑保持一致）
+        mask = df[req.column_name].apply(lambda v: (
+            (v.strip() if isinstance(v, str) else v) in id_set
+        ))  # 创建布尔掩码
+        
+        df_filtered = df[mask].copy()  # 筛选出匹配的行（保留所有列）
+        
+        # 按照结果 ID 列表的顺序对筛选后的行进行排序
+        # 说明：创建一个排序键列，表示每行 ID 在结果列表中的位置
+        def get_sort_key(v):
+            # 对字符串做 strip 处理后查找顺序
+            normalized_v = v.strip() if isinstance(v, str) else v
+            # 返回该 ID 在结果列表中的位置，如果不存在则返回一个很大的数（理论上不会发生）
+            return id_order_map.get(normalized_v, float('inf'))
+        
+        df_filtered['_sort_key'] = df_filtered[req.column_name].apply(get_sort_key)  # 添加排序键列
+        df_filtered = df_filtered.sort_values('_sort_key')  # 按排序键排序
+        df_filtered = df_filtered.drop('_sort_key', axis=1)  # 删除临时排序键列
+        df_filtered = df_filtered.reset_index(drop=True)  # 重置索引，使行号从 0 开始连续
+        
+        # 生成导出文件名：原文件名_filtered.xlsx
+        base_name, ext = os.path.splitext(sf.filename)  # 分离文件名和扩展名
+        new_filename = f"{base_name}_filtered.xlsx"  # 新文件名
+        
+        filtered_files.append((new_filename, df_filtered))  # 记录
+    
+    # 如果只有一个文件，直接返回 Excel
+    if len(filtered_files) == 1:  # 只有一个文件
+        filename, df = filtered_files[0]  # 获取文件名和 DataFrame
+        bio = io.BytesIO()  # 二进制缓冲
+        with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:  # 创建 ExcelWriter
+            df.to_excel(writer, index=False, sheet_name="filtered")  # 写入 sheet
+        bio.seek(0)  # 重置指针
+        return StreamingResponse(  # 返回流式响应
+            bio,  # bytes 流
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # MIME
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},  # 下载文件名
+        )
+    
+    # 多个文件：打包为 ZIP
+    import zipfile
+    zip_bio = io.BytesIO()  # ZIP 文件缓冲
+    with zipfile.ZipFile(zip_bio, "w", zipfile.ZIP_DEFLATED) as zf:  # 创建 ZIP
+        for filename, df in filtered_files:  # 遍历每个文件
+            # 将 DataFrame 写入内存中的 Excel
+            excel_bio = io.BytesIO()  # Excel 缓冲
+            with pd.ExcelWriter(excel_bio, engine="xlsxwriter") as writer:  # 创建 ExcelWriter
+                df.to_excel(writer, index=False, sheet_name="filtered")  # 写入 sheet
+            excel_bio.seek(0)  # 重置指针
+            # 添加到 ZIP
+            zf.writestr(filename, excel_bio.read())  # 写入 ZIP
+    
+    zip_bio.seek(0)  # 重置指针
+    return StreamingResponse(  # 返回流式响应
+        zip_bio,  # bytes 流
+        media_type="application/zip",  # MIME
+        headers={"Content-Disposition": 'attachment; filename="filtered_data.zip"'},  # 下载文件名
+    )
 
 
 # 静态前端托管（Vanilla 前端）

@@ -99,13 +99,36 @@
             <div id="resultPreview" class="monoBox"></div>
           </div>
           <div>
-            <h3>下载</h3>
+            <h3>下载结果列表</h3>
             <div class="row">
               <button id="btnDownloadCsv">下载 CSV</button>
               <button id="btnDownloadXlsx">下载 XLSX</button>
             </div>
-            <p class="hint">下载会从后端按 result_id 导出。</p>
+            <p class="hint">下载会从后端按 result_id 导出结果列表。</p>
           </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>7) 基于结果导出原始数据</h2>
+        <p class="hint">
+          根据上一步计算出的 ID 列表，从原始上传的文件中筛选出匹配的所有行（保留所有列），并导出。
+        </p>
+        <div class="stack">
+          <div class="row">
+            <label>选择要导出的原始文件（可多选）：</label>
+            <div id="exportRawFilesCheckboxes" class="wrap"></div>
+          </div>
+          <div class="row">
+            <label>筛选列名：</label>
+            <input id="exportRawColumnName" type="text" value="patient_id" placeholder="例如：patient_id" />
+            <button id="btnExportRaw">导出原始数据</button>
+          </div>
+          <div id="exportRawStatus" class="status"></div>
+          <p class="hint">
+            - 单个文件：导出为 filename_filtered.xlsx<br />
+            - 多个文件：导出为 filtered_data.zip（包含所有筛选后的文件）
+          </p>
         </div>
       </section>
 
